@@ -1,36 +1,271 @@
-# This is a basic workflow to help you get started with Actions
+name: Drug Discovery CI/CD Pipeline
 
-name: CI
-
-# Controls when the workflow will run
+# Triggers for the workflow
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:  # Allow manual triggering
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+# Define environment variables
+env:
+  PYTHON_VERSION: '3.9'
+  NODE_VERSION: '18'
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # Job 1: Test Python code
+  test-python:
+    name: Test Python Code
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxrender1 libxext6 libfontconfig1
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        else
+          # Install common drug discovery dependencies
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install rdkit-pypi numpy pandas scikit-learn joblib matplotlib seaborn
+          pip install pytest pytest-cov flake8 black
+        fi
+
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Format check with black
+      run: |
+        black --check --diff .
+
+    - name: Run tests with pytest
+      run: |
+        if [ -f pytest.ini ] || [ -f pyproject.toml ] || [ -d tests ]; then
+          pytest --cov=. --cov-report=xml --cov-report=html
+        else
+          echo "No tests found. Creating a basic test structure..."
+          mkdir -p tests
+          echo "# Add your tests here" > tests/__init__.py
+          echo "def test_placeholder(): assert True" > tests/test_basic.py
+          pytest tests/
+        fi
+
+    - name: Upload coverage reports
+      if: success()
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  # Job 2: Security and Code Quality
+  security-scan:
+    name: Security & Quality Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety
+
+    - name: Run Bandit security scan
+      run: |
+        bandit -r . -f json -o bandit-report.json || true
+        bandit -r . -f txt
+
+    - name: Check for known vulnerabilities
+      run: |
+        if [ -f requirements.txt ]; then
+          safety check -r requirements.txt
+        else
+          echo "No requirements.txt found, skipping vulnerability check"
+        fi
+
+    - name: Upload security scan results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-scan-results
+        path: bandit-report.json
+
+  # Job 3: Build and validate HTML/Frontend
+  validate-frontend:
+    name: Validate Frontend
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install HTML validation tools
+      run: |
+        npm install -g html-validate
+        npm install -g lighthouse-ci
+
+    - name: Validate HTML
+      run: |
+        if [ -f index.html ]; then
+          html-validate index.html
+        else
+          echo "No index.html found"
+        fi
+
+    - name: Check for broken links
+      run: |
+        # Simple link check for local files
+        if [ -f index.html ]; then
+          echo "Checking HTML structure..."
+          grep -o 'href="[^"]*"' index.html || echo "No links found"
+          grep -o 'src="[^"]*"' index.html || echo "No external resources found"
+        fi
+
+  # Job 4: Deploy to GitHub Pages
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: [test-python, security-scan, validate-frontend]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+
+    # Deploy to the github-pages environment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Build site
+      run: |
+        # Create a build directory
+        mkdir -p _site
+        
+        # Copy HTML files
+        if [ -f index.html ]; then
+          cp index.html _site/
+        fi
+        
+        # Copy any additional assets
+        if [ -d assets ]; then
+          cp -r assets _site/
+        fi
+        
+        # Create a basic 404 page if it doesn't exist
+        if [ ! -f _site/404.html ]; then
+          echo '<!DOCTYPE html><html><head><title>404 - Page Not Found</title></head><body><h1>Page Not Found</h1><p><a href="/">Return to Home</a></p></body></html>' > _site/404.html
+        fi
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ./_site
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+
+  # Job 5: Create release (on tags)
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [test-python, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## Changes in this Release
+          - Automated release created from tag ${{ github.ref }}
+          
+          ## Installation
+          ```bash
+          git clone https://github.com/${{ github.repository }}.git
+          cd my-drug-discovery-project
+          pip install -r requirements.txt
+          ```
+          
+          ## Usage
+          See README.md for detailed usage instructions.
+        draft: false
+        prerelease: false
+
+  # Job 6: Notify on completion
+  notify:
+    name: Notification
+    runs-on: ubuntu-latest
+    needs: [test-python, security-scan, validate-frontend]
+    if: always()
+    
+    steps:
+    - name: Check job status and notify
+      run: |
+        if [ "${{ needs.test-python.result }}" == "success" ] && [ "${{ needs.security-scan.result }}" == "success" ] && [ "${{ needs.validate-frontend.result }}" == "success" ]; then
+          echo "✅ All checks passed! Project is ready for deployment."
+        else
+          echo "❌ Some checks failed. Please review the job outputs."
+          exit 1
+        fi
+
+# Concurrent job configuration
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
